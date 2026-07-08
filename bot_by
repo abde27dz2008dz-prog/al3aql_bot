@@ -1,0 +1,204 @@
+import asyncio
+import logging
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    Message, LabeledPrice, PreCheckoutQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+
+import config
+import database as db
+from ai_service import ask_ai
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=config.BOT_TOKEN)
+dp = Dispatcher()
+
+
+# ---------- لوحات الأزرار ----------
+
+def main_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 اشتراك مميز", callback_data="buy_premium")],
+        [InlineKeyboardButton(text="👥 ادعُ أصدقاء واربح طلبات مجانية", callback_data="invite")],
+        [InlineKeyboardButton(text="ℹ️ كيفاش نستخدم البوت", callback_data="help")],
+    ])
+
+
+# ---------- /start (مع دعم رابط الإحالة) ----------
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message, command: CommandObject):
+    referred_by = None
+    if command.args and command.args.startswith("ref_"):
+        try:
+            ref_id = int(command.args.replace("ref_", ""))
+            if ref_id != message.from_user.id:
+                referred_by = ref_id
+        except ValueError:
+            pass
+
+    user = db.get_or_create_user(message.from_user.id, message.from_user.username, referred_by)
+
+    # مكافأة صاحب الإحالة أول مرة فقط
+    if referred_by and user["referred_by"] == referred_by:
+        db.add_referral_bonus(referred_by, config.REFERRAL_BONUS_CREDITS)
+        try:
+            await bot.send_message(
+                referred_by,
+                f"🎉 صديق جديد دخل عبر رابط دعوتك! ربحت {config.REFERRAL_BONUS_CREDITS} طلبات إضافية اليوم."
+            )
+        except Exception:
+            pass
+
+    await message.answer(
+        "👋 مرحبا بيك فـ *العقل* — مساعدك الذكي!\n\n"
+        f"عندك {config.FREE_DAILY_CREDITS} طلبات مجانية كل يوم (تلخيص، ترجمة، إجابة على أسئلة، كتابة نصوص...).\n"
+        "غير ابعثلي أي سؤال أو نص وراح نجاوبك.\n\n"
+        "تحب طلبات بلا حدود؟ اشترك فـ النسخة المميزة 👇",
+        parse_mode="Markdown",
+        reply_markup=main_menu_kb()
+    )
+
+
+@dp.callback_query(F.data == "help")
+async def cb_help(callback):
+    await callback.message.answer(
+        "📌 *كيفاش تستخدم البوت:*\n"
+        "- ابعث أي نص وراح يلخصلك، يترجملك، أو يجاوبك عليه.\n"
+        "- عندك عدد محدود من الطلبات مجانا كل يوم.\n"
+        "- `/premium` للاشتراك بلا حدود.\n"
+        "- `/invite` باش تجيب أصدقاء وتربح طلبات إضافية.",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+# ---------- الإحالة ----------
+
+@dp.message(Command("invite"))
+async def cmd_invite(message: Message):
+    bot_info = await bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start=ref_{message.from_user.id}"
+    await message.answer(
+        "👥 *ادعُ أصدقاءك:*\n"
+        f"شارك هذا الرابط، وكل صديق يدخل بيه يديك {config.REFERRAL_BONUS_CREDITS} طلبات مجانية إضافية:\n\n"
+        f"{link}",
+        parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data == "invite")
+async def cb_invite(callback):
+    await cmd_invite(callback.message)
+    await callback.answer()
+
+
+# ---------- الدفع عبر Telegram Stars ----------
+
+@dp.message(Command("premium"))
+async def cmd_premium(message: Message):
+    await send_premium_invoice(message.chat.id)
+
+
+@dp.callback_query(F.data == "buy_premium")
+async def cb_buy_premium(callback):
+    await send_premium_invoice(callback.message.chat.id)
+    await callback.answer()
+
+
+async def send_premium_invoice(chat_id: int):
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title="اشتراك مميز - شهر كامل",
+        description="طلبات بلا حدود يوميا + بدون إعلانات + أولوية فالرد.",
+        payload="premium_month",
+        provider_token="",  # فارغ إجباريا مع Stars
+        currency="XTR",
+        prices=[LabeledPrice(label="اشتراك شهري", amount=config.PREMIUM_PRICE_STARS)],
+    )
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_q: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    db.activate_premium(message.from_user.id, days=30)
+    db.log_payment(message.from_user.id, message.successful_payment.total_amount)
+    await message.answer(
+        "✅ تم تفعيل الاشتراك المميز لمدة 30 يوم! صحة عليك، دابا عندك طلبات بلا حدود 🎉"
+    )
+
+
+# ---------- لوحة الأدمن ----------
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    stats = db.get_stats()
+    await message.answer(
+        f"📊 *إحصائيات البوت:*\n"
+        f"- المستخدمين: {stats['total_users']}\n"
+        f"- المشتركين المميزين: {stats['premium_users']}\n"
+        f"- مجموع Stars المحصلة: {stats['total_stars']} ⭐",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(Command("addad"))
+async def cmd_addad(message: Message, command: CommandObject):
+    if message.from_user.id not in config.ADMIN_IDS:
+        return
+    if not command.args:
+        await message.answer("استخدم: /addad نص الإعلان هنا")
+        return
+    db.add_ad(command.args)
+    await message.answer("✅ تمت إضافة الإعلان.")
+
+
+# ---------- المعالج الرئيسي: أي رسالة نصية ----------
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_text(message: Message):
+    allowed, user = db.can_use_bot(message.from_user.id, message.from_user.username)
+
+    if not allowed:
+        await message.answer(
+            "⏳ استهلكت كل طلباتك المجانية لهذا اليوم.\n"
+            "راجع غدا، أو فعّل الاشتراك المميز باش يكون عندك طلبات بلا حدود:\n"
+            "/premium",
+            reply_markup=main_menu_kb()
+        )
+        return
+
+    thinking = await message.answer("⏳ رايح نجاوبك...")
+    reply = await ask_ai(message.text)
+    await thinking.delete()
+    await message.answer(reply)
+
+    db.consume_credit(message.from_user.id)
+
+    # عرض إعلان ممول كل N ردود للمستخدمين غير المميزين
+    is_premium = db.is_premium_active(db.get_or_create_user(message.from_user.id, message.from_user.username))
+    if not is_premium and config.ADS_EVERY_N_REPLIES > 0:
+        user_after = db.get_or_create_user(message.from_user.id, message.from_user.username)
+        if user_after["total_replies"] % config.ADS_EVERY_N_REPLIES == 0:
+            ad = db.get_random_active_ad()
+            if ad:
+                await message.answer(f"📢 *إعلان ممول:*\n{ad['text']}", parse_mode="Markdown")
+
+
+async def main():
+    db.init_db()
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
